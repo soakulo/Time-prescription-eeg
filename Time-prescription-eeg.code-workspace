@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "Time-prescription-eeg",
+			"path": "."
+		},
+		{
+			"name": "Time-prescription",
+			"path": "../../Time-prescription"
+		}
+	],
+	"settings": {}
+}
