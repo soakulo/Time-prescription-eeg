@@ -1,0 +1,46 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Outfit:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-display: "Outfit", "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  /* Custom palette exact to the mockup */
+  --color-canvas-dark: #070c14;
+  --color-panel-dark: #0d1424;
+  --color-panel-border: #1a263e;
+  --color-panel-active-border: #1e62fec0;
+  
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+}
+
+/* Base modifications for beautiful scrollbars and overall smoothness */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(30, 41, 59, 0.5) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(30, 41, 59, 0.5);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(30, 41, 59, 0.8);
+}
+
+body {
+  background-color: #070c14;
+  color: #c9d1d9;
+}

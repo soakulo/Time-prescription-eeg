@@ -1,0 +1,6 @@
+{
+  "name": "Комплекс для исследования восприятия времени",
+  "description": "Professional psychophysiological software for conducting subjective time perception, reaction speed, and TTC experiments, complete with EEG trigger simulation and real-time metrics telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
