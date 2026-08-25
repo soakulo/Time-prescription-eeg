@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { ExperimentalMode } from "../types";
 import { useLabStore } from "../store";
 import { UNIQUE_CURVES } from "../curves";
@@ -31,7 +31,7 @@ function pointsToSegments(points: Point[]): Segment[] {
     segments.push({
       p1,
       p2,
-      distance: getDistance(p1, p2)
+      distance: getDistance(p1, p2),
     });
   }
   return segments;
@@ -56,8 +56,8 @@ function findByDistance(segments: Segment[], distance: number) {
   }
 
   if (overflow) {
-    currSegmentNum = segments.length - 1;
-    leftDistance = segments[currSegmentNum].distance;
+    currSegmentNum = Math.max(0, segments.length - 1);
+    leftDistance = segments.length > 0 ? segments[currSegmentNum].distance : 0;
   }
 
   return { segment: currSegmentNum, position: leftDistance };
@@ -67,27 +67,27 @@ function getPathPoint(segments: Segment[], distance: number): Point {
   if (segments.length === 0) return { x: 0, y: 0 };
   const pos = findByDistance(segments, distance);
   const curSegment = segments[pos.segment];
-  if (curSegment.distance === 0) return curSegment.p1;
+  if (!curSegment || curSegment.distance === 0) return curSegment ? curSegment.p1 : { x: 0, y: 0 };
 
   const strideFrac = pos.position / curSegment.distance;
   const sx = curSegment.p2.x - curSegment.p1.x;
   const sy = curSegment.p2.y - curSegment.p1.y;
   return {
     x: curSegment.p1.x + sx * strideFrac,
-    y: curSegment.p1.y + sy * strideFrac
+    y: curSegment.p1.y + sy * strideFrac,
   };
 }
 
 /**
- * Renders a polyline trajectory (ломаная линия) passing through vertices p1 -> p2 -> ... -> pN.
- * Also renders vertex point nodes at control points along the polyline.
+ * Draws a polyline segment within distance range.
  */
 function drawPolyline(
   ctx: CanvasRenderingContext2D,
   segments: Segment[],
   curvePoints: Point[],
-  scaleX: number,
-  scaleY: number,
+  toCanvasX: (x: number) => number,
+  toCanvasY: (y: number) => number,
+  toCanvasSize: (s: number) => number,
   fromDistance: number = 0,
   toDistance: number = Infinity
 ) {
@@ -103,39 +103,32 @@ function drawPolyline(
   const startPos = findByDistance(segments, fromDistance);
   const endPos = findByDistance(segments, actualToDist);
 
-  // 1. Draw connected line segments of the polyline
   ctx.beginPath();
-  ctx.moveTo(startPt.x * scaleX, startPt.y * scaleY);
+  ctx.moveTo(toCanvasX(startPt.x), toCanvasY(startPt.y));
 
   if (startPos.segment === endPos.segment) {
-    ctx.lineTo(endPt.x * scaleX, endPt.y * scaleY);
+    ctx.lineTo(toCanvasX(endPt.x), toCanvasY(endPt.y));
   } else {
-    // Line to end of start segment (p2)
-    ctx.lineTo(segments[startPos.segment].p2.x * scaleX, segments[startPos.segment].p2.y * scaleY);
-
-    // Lines to ends of intermediate segments
+    ctx.lineTo(toCanvasX(segments[startPos.segment].p2.x), toCanvasY(segments[startPos.segment].p2.y));
     for (let i = startPos.segment + 1; i < endPos.segment; i++) {
-      ctx.lineTo(segments[i].p2.x * scaleX, segments[i].p2.y * scaleY);
+      ctx.lineTo(toCanvasX(segments[i].p2.x), toCanvasY(segments[i].p2.y));
     }
-
-    // Line to final point
-    ctx.lineTo(endPt.x * scaleX, endPt.y * scaleY);
+    ctx.lineTo(toCanvasX(endPt.x), toCanvasY(endPt.y));
   }
-
   ctx.stroke();
 
-  // 2. Draw vertex node circles at control points that fall within [fromDistance, actualToDist]
+  // Draw vertices along this segment
   const savedDash = ctx.getLineDash();
-  ctx.setLineDash([]); // Ensure control vertex dots are drawn solid
+  ctx.setLineDash([]);
   let accumDist = 0;
   for (let i = 0; i < curvePoints.length; i++) {
     if (i > 0) {
       accumDist += segments[i - 1].distance;
     }
-    if (accumDist >= fromDistance - 0.5 && accumDist <= actualToDist + 0.5) {
+    if (accumDist >= fromDistance - 1 && accumDist <= actualToDist + 1) {
       const pt = curvePoints[i];
       ctx.beginPath();
-      ctx.arc(pt.x * scaleX, pt.y * scaleY, 4.5 * scaleX, 0, Math.PI * 2);
+      ctx.arc(toCanvasX(pt.x), toCanvasY(pt.y), toCanvasSize(4), 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
     }
@@ -149,8 +142,8 @@ interface ExperimentCanvasProps {
 
 export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  
-  // Connect to Zustand store
+
+  // Zustand State
   const currentMode = useLabStore((s) => s.currentMode);
   const activeTrialCondition = useLabStore((s) => s.activeTrialCondition);
   const activeTrialState = useLabStore((s) => s.activeTrialState);
@@ -158,19 +151,13 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
   const activeDuration = useLabStore((s) => s.activeDuration);
   const activeTrajectoryIndex = useLabStore((s) => s.activeTrajectoryIndex);
   const isPaused = useLabStore((s) => s.isPaused);
-  const currentTrial = useLabStore((s) => s.currentTrial);
-  const currentBlock = useLabStore((s) => s.currentBlock);
-  const isTraining = useLabStore((s) => s.isTraining);
-  const trainingTrialIndex = useLabStore((s) => s.trainingTrialIndex);
-  const trainingTrialsCount = useLabStore((s) => s.config.trainingTrialsCount || 5);
   const setTrialState = useLabStore((s) => s.setTrialState);
   const logSystemMessage = useLabStore((s) => s.logSystemMessage);
 
-  // Interval Reproduction State Flow (Local to Animation Canvas)
-  const [demoActive, setDemoActive] = useState(false);
-  const [reproducingActive, setReproducingActive] = useState(false);
+  // Holding state for UI button
+  const [isHoldingState, setIsHoldingState] = useState(false);
 
-  // High precision time keepers (relative to anim starts)
+  // Mutable reference for 60fps / 120fps render loop
   const stateRef = useRef({
     activeTrialState,
     currentMode,
@@ -179,23 +166,19 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
     activeDuration,
     activeTrajectoryIndex: activeTrajectoryIndex ?? 0,
     isPaused,
-    currentTrial,
-    currentBlock,
-    isTraining,
-    trainingTrialIndex,
-    trainingTrialsCount,
     startTime: 0,
-    motionEndTime: 0,
     userPressTime: 0,
     hasResponded: false,
-    width: 700,
-    height: 400,
     reproActive: false,
     reproStartTime: 0,
-    recordedTimePart1: 0,
+    // Condition 4: Hold Space Duration
+    isHoldingSpace: false,
+    holdStartTime: 0,
+    lastRecordedTime: 0,
+    frozenPos: null as Point | null,
   });
 
-  // Keep stateRef in sync with external properties
+  // Sync state with React state changes
   useEffect(() => {
     stateRef.current.activeTrialState = activeTrialState;
     stateRef.current.currentMode = currentMode;
@@ -204,283 +187,344 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
     stateRef.current.activeDuration = activeDuration;
     stateRef.current.activeTrajectoryIndex = activeTrajectoryIndex ?? 0;
     stateRef.current.isPaused = isPaused;
-    stateRef.current.currentTrial = currentTrial;
-    stateRef.current.currentBlock = currentBlock;
-    stateRef.current.isTraining = isTraining;
-    stateRef.current.trainingTrialIndex = trainingTrialIndex;
-    stateRef.current.trainingTrialsCount = trainingTrialsCount;
-  }, [activeTrialState, currentMode, activeTrialCondition, activeSpeed, activeDuration, activeTrajectoryIndex, isPaused, currentTrial, currentBlock, isTraining, trainingTrialIndex, trainingTrialsCount]);
+  }, [activeTrialState, currentMode, activeTrialCondition, activeSpeed, activeDuration, activeTrajectoryIndex, isPaused]);
 
-  // Handle canvas size tracking
+  // Main Render Loop
   useEffect(() => {
-    const handleResize = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = rect.width * window.devicePixelRatio;
-      canvas.height = rect.height * window.devicePixelRatio;
-    };
-
-    handleResize();
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
-
-  // Main high-performance Animation Frame Loop
-  useEffect(() => {
-    let animationId: number;
-    let particles: Array<{ x: number; y: number; size: number; alpha: number; speedY: number }> = [];
-
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    let animationId: number;
+
     const render = () => {
-      const ctx = canvas.getContext("2d");
-      if (!ctx || isPaused) {
+      if (stateRef.current.isPaused) {
         animationId = requestAnimationFrame(render);
         return;
       }
 
+      // Handle High DPI and dynamic resizing without distortion
       const dpr = window.devicePixelRatio || 1;
-      const w = canvas.width;
-      const h = canvas.height;
-      
-      // virtual coordinates: 700w x 400h (to perfectly map curves)
-      const scaleX = w / 700;
-      const scaleY = h / 400;
+      const rect = canvas.getBoundingClientRect();
+      const targetW = Math.round(rect.width * dpr);
+      const targetH = Math.round(rect.height * dpr);
+
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+
+      const w = rect.width;
+      const h = rect.height;
+
+      // Virtual Coordinate System (700 x 400)
+      const virtualW = 700;
+      const virtualH = 400;
+      const uniformScale = Math.min(w / virtualW, h / virtualH);
+      const offsetX = (w - virtualW * uniformScale) / 2;
+      const offsetY = (h - virtualH * uniformScale) / 2;
+
+      const toCanvasX = (x: number) => offsetX + x * uniformScale;
+      const toCanvasY = (y: number) => offsetY + y * uniformScale;
+      const toCanvasSize = (s: number) => s * uniformScale;
 
       ctx.clearRect(0, 0, w, h);
 
-      // 1. Draw scientific background grid
+      // 1. Scientific coordinate grid
       ctx.strokeStyle = "rgba(40, 80, 180, 0.08)";
       ctx.lineWidth = 1;
-      for (let x = 0; x < 700; x += 50) {
+      for (let x = 0; x <= 700; x += 50) {
         ctx.beginPath();
-        ctx.moveTo(x * scaleX, 0);
-        ctx.lineTo(x * scaleX, h);
+        ctx.moveTo(toCanvasX(x), toCanvasY(0));
+        ctx.lineTo(toCanvasX(x), toCanvasY(400));
         ctx.stroke();
       }
-      for (let y = 0; y < 400; y += 50) {
+      for (let y = 0; y <= 400; y += 50) {
         ctx.beginPath();
-        ctx.moveTo(0, y * scaleY);
-        ctx.lineTo(w, y * scaleY);
+        ctx.moveTo(toCanvasX(0), toCanvasY(y));
+        ctx.lineTo(toCanvasX(700), toCanvasY(y));
         ctx.stroke();
       }
 
-      // Outer bounding safe box
-      ctx.strokeStyle = "rgba(80, 120, 255, 0.2)";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(5 * scaleX, 5 * scaleY, 690 * scaleX, 390 * scaleY);
+      // 2. Safe border
+      ctx.strokeStyle = "rgba(80, 120, 255, 0.25)";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(toCanvasX(5), toCanvasY(5), toCanvasSize(690), toCanvasSize(390));
 
-      // Mode-specific animations
+      // Active state and condition
       const activeState = stateRef.current.activeTrialState;
-      const mode = stateRef.current.currentMode;
-      const duration = stateRef.current.activeDuration;
-      const speedValue = stateRef.current.activeSpeed; // px per second
-      const currentTrialVal = stateRef.current.currentTrial;
-      const currentBlockVal = stateRef.current.currentBlock;
-
-      // Select active randomized trajectory curve
+      const condition = stateRef.current.activeTrialCondition;
+      const duration = stateRef.current.activeDuration; // Ti (800, 1700, 3100 ms)
       const curveIndex = Math.abs(stateRef.current.activeTrajectoryIndex ?? 0) % UNIQUE_CURVES.length;
       const curvePoints = UNIQUE_CURVES[curveIndex];
       const segments = pointsToSegments(curvePoints);
       const totalDistance = getTotalDistance(segments);
 
-      // Render clean, distraction-free stage
-      if (mode === ExperimentalMode.REACTION_VISIBLE || mode === ExperimentalMode.TTC) {
-        // Path visible distance before occlusion in TTC mode
-        // 35% of the polyline is visible before entering occlusion (making the occlusion area large and prominent)
-        const visibleFraction = mode === ExperimentalMode.TTC ? 0.35 : 1.0;
-        const visibleDistance = visibleFraction * totalDistance;
+      // =========================================================================
+      // CONDITION 1: REACTION_VISIBLE (5.2.1 Реакция на движение с вылетом за цель)
+      // =========================================================================
+      if (condition === ExperimentalMode.REACTION_VISIBLE) {
+        // Target arrival time: 600ms input segment + Ti
+        const targetTimeMs = 600 + duration;
+        // Overshoot extension time: ball continues past target for 900ms
+        const overshootTimeMs = 900;
+        const totalMotionTimeMs = targetTimeMs + overshootTimeMs;
+
+        // Target point is placed at fraction: targetTimeMs / totalMotionTimeMs
+        const targetDistance = (targetTimeMs / totalMotionTimeMs) * totalDistance;
         const startPt = getPathPoint(segments, 0);
-        const targetPt = getPathPoint(segments, totalDistance);
+        const targetPt = getPathPoint(segments, targetDistance);
+        const finishPt = getPathPoint(segments, totalDistance);
 
-        // 1. Render Start Marker
+        // Start marker
         ctx.fillStyle = "#3B82F6";
-        ctx.fillRect((startPt.x - 3) * scaleX, (startPt.y - 35) * scaleY, 6 * scaleX, 70 * scaleY);
-        ctx.font = `bold ${11 * scaleY}px "JetBrains Mono", sans-serif`;
-        ctx.fillText("СТАРТ", (startPt.x - 20) * scaleX, (startPt.y - 42) * scaleY);
+        ctx.fillRect(toCanvasX(startPt.x - 3), toCanvasY(startPt.y - 25), toCanvasSize(6), toCanvasSize(50));
+        ctx.font = `bold ${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+        ctx.fillText("СТАРТ", toCanvasX(startPt.x - 18), toCanvasY(startPt.y - 32));
 
-        if (mode === ExperimentalMode.TTC) {
-          // 2. Draw OPEN / VISIBLE portion of trajectory (solid line & solid vertex nodes)
-          ctx.strokeStyle = "#3B82F6";
-          ctx.fillStyle = "#60A5FA";
-          ctx.lineWidth = 3.2;
-          drawPolyline(ctx, segments, curvePoints, scaleX, scaleY, 0, visibleDistance);
+        // 1. Draw Full Polyline Trajectory (pre-target and post-target overshoot)
+        ctx.strokeStyle = "rgba(59, 130, 246, 0.4)";
+        ctx.fillStyle = "#3B82F6";
+        ctx.lineWidth = toCanvasSize(3.2);
+        drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, 0, totalDistance);
 
-          // 3. Render LARGE OCCLUSION SCREEN PANEL (Экран окклюзии)
-          // Compute bounding box covering the occluded section
-          const occludedPoints: Point[] = [];
-          for (let d = visibleDistance; d <= totalDistance; d += 4) {
-            occludedPoints.push(getPathPoint(segments, d));
-          }
-          occludedPoints.push(targetPt);
+        // Highlight main target segment with solid blue
+        ctx.strokeStyle = "#3B82F6";
+        drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, 0, targetDistance);
 
-          const xs = occludedPoints.map(p => p.x);
-          const ys = occludedPoints.map(p => p.y);
-          const minX = Math.min(...xs);
-          const maxX = Math.max(...xs);
-          const minY = Math.min(...ys);
-          const maxY = Math.max(...ys);
+        // Highlight overshoot segment with subtle dashed/amber warning line
+        ctx.strokeStyle = "rgba(245, 158, 11, 0.45)";
+        ctx.setLineDash([4, 4]);
+        drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, targetDistance, totalDistance);
+        ctx.setLineDash([]);
 
-          const occluderX = Math.max(6, minX - 35);
-          const occluderY = Math.max(8, minY - 45);
-          const occluderWidth = Math.min(692 - occluderX, (maxX - minX) + 65);
-          const occluderHeight = Math.min(386 - occluderY, (maxY - minY) + 85);
+        // Target Marker (Red Crosshair + Bullseye) at targetDistance
+        ctx.fillStyle = "rgba(239, 68, 68, 0.15)";
+        ctx.beginPath();
+        ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(18), 0, Math.PI * 2);
+        ctx.fill();
 
-          // Dark slate background for occlusion screen barrier
-          ctx.fillStyle = "rgba(11, 19, 36, 0.95)";
-          ctx.fillRect(occluderX * scaleX, occluderY * scaleY, occluderWidth * scaleX, occluderHeight * scaleY);
-
-          // Glowing blue-cyan frame
-          ctx.strokeStyle = "rgba(59, 130, 246, 0.75)";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(occluderX * scaleX, occluderY * scaleY, occluderWidth * scaleX, occluderHeight * scaleY);
-
-          // Header title bar on top of the occluder
-          ctx.fillStyle = "rgba(30, 58, 138, 0.6)";
-          ctx.fillRect(occluderX * scaleX, occluderY * scaleY, occluderWidth * scaleX, 22 * scaleY);
-          ctx.strokeStyle = "rgba(59, 130, 246, 0.4)";
-          ctx.lineWidth = 1;
-          ctx.strokeRect(occluderX * scaleX, occluderY * scaleY, occluderWidth * scaleX, 22 * scaleY);
-
-          ctx.fillStyle = "#93C5FD";
-          ctx.font = `bold ${10 * scaleY}px "JetBrains Mono", sans-serif`;
-          ctx.fillText("ЭКРАН ОККЛЮЗИИ (ЗОНА СКРЫТИЯ)", (occluderX + 10) * scaleX, (occluderY + 15) * scaleY);
-
-          // Entrance boundary gate indicator at visibleDistance
-          const occludeEntryPt = getPathPoint(segments, visibleDistance);
-          ctx.strokeStyle = "rgba(245, 158, 11, 0.85)";
-          ctx.lineWidth = 2;
-          ctx.setLineDash([4, 4]);
-          ctx.beginPath();
-          ctx.moveTo(occludeEntryPt.x * scaleX, (occludeEntryPt.y - 25) * scaleY);
-          ctx.lineTo(occludeEntryPt.x * scaleX, (occludeEntryPt.y + 25) * scaleY);
-          ctx.stroke();
-          ctx.setLineDash([]);
-
-          ctx.fillStyle = "#FBBF24";
-          ctx.font = `bold ${9 * scaleY}px "JetBrains Mono", sans-serif`;
-          ctx.fillText("ВХОД", (occludeEntryPt.x - 14) * scaleX, (occludeEntryPt.y - 30) * scaleY);
-
-          // 4. Draw trajectory BEHIND occlusion: dashed line, intermediate reference dots, and vertex points
-          ctx.strokeStyle = "rgba(147, 197, 253, 0.7)";
-          ctx.fillStyle = "#38BDF8";
-          ctx.lineWidth = 2.2;
-          ctx.setLineDash([6, 6]);
-          drawPolyline(ctx, segments, curvePoints, scaleX, scaleY, visibleDistance, totalDistance);
-          ctx.setLineDash([]);
-
-          // Intermediate guide dots along the dashed path behind occlusion
-          const occludedLength = totalDistance - visibleDistance;
-          const stepDist = 35; // Step every ~35px along occluded track
-          const numSteps = Math.max(3, Math.floor(occludedLength / stepDist));
-          for (let s = 1; s <= numSteps; s++) {
-            const d = visibleDistance + s * (occludedLength / (numSteps + 1));
-            const pt = getPathPoint(segments, d);
-            ctx.fillStyle = "rgba(147, 197, 253, 0.85)";
-            ctx.strokeStyle = "rgba(15, 23, 42, 0.9)";
-            ctx.lineWidth = 1.5 * scaleX;
-            ctx.beginPath();
-            ctx.arc(pt.x * scaleX, pt.y * scaleY, 3.5 * scaleX, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.stroke();
-          }
-
-          // Highlighted vertex points inside the occluded area
-          let accumDist = 0;
-          for (let i = 0; i < curvePoints.length; i++) {
-            if (i > 0) accumDist += segments[i - 1].distance;
-            if (accumDist >= visibleDistance - 0.5 && accumDist <= totalDistance - 10) {
-              const pt = curvePoints[i];
-              // Outer bright cyan marker dot
-              ctx.fillStyle = "#38BDF8";
-              ctx.strokeStyle = "#FFFFFF";
-              ctx.lineWidth = 1.5 * scaleX;
-              ctx.beginPath();
-              ctx.arc(pt.x * scaleX, pt.y * scaleY, 5 * scaleX, 0, Math.PI * 2);
-              ctx.fill();
-              ctx.stroke();
-
-              // Inner white center
-              ctx.fillStyle = "#FFFFFF";
-              ctx.beginPath();
-              ctx.arc(pt.x * scaleX, pt.y * scaleY, 2 * scaleX, 0, Math.PI * 2);
-              ctx.fill();
-            }
-          }
-        } else {
-          // Mode 1: REACTION_VISIBLE - draw full solid trajectory
-          ctx.strokeStyle = "#3B82F6";
-          ctx.fillStyle = "#60A5FA";
-          ctx.lineWidth = 3.2;
-          drawPolyline(ctx, segments, curvePoints, scaleX, scaleY, 0, totalDistance);
-        }
-
-        // 5. Render Target Point (Целевая точка / Финиш)
         ctx.fillStyle = "#EF4444";
         ctx.beginPath();
-        ctx.arc(targetPt.x * scaleX, targetPt.y * scaleY, 14 * scaleX, 0, Math.PI * 2);
+        ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(10), 0, Math.PI * 2);
         ctx.fill();
         ctx.strokeStyle = "#FFFFFF";
-        ctx.lineWidth = 2.5 * scaleX;
+        ctx.lineWidth = toCanvasSize(2);
         ctx.stroke();
 
         ctx.fillStyle = "#FFFFFF";
         ctx.beginPath();
-        ctx.arc(targetPt.x * scaleX, targetPt.y * scaleY, 5 * scaleX, 0, Math.PI * 2);
+        ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(3.5), 0, Math.PI * 2);
+        ctx.fill();
+
+        // Crosshairs
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.9)";
+        ctx.lineWidth = toCanvasSize(1.5);
+        ctx.beginPath();
+        ctx.moveTo(toCanvasX(targetPt.x - 20), toCanvasY(targetPt.y));
+        ctx.lineTo(toCanvasX(targetPt.x + 20), toCanvasY(targetPt.y));
+        ctx.moveTo(toCanvasX(targetPt.x), toCanvasY(targetPt.y - 20));
+        ctx.lineTo(toCanvasX(targetPt.x), toCanvasY(targetPt.y + 20));
+        ctx.stroke();
+
+        // Target text
+        ctx.fillStyle = "#F87171";
+        ctx.font = `bold ${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+        ctx.fillText("ЦЕЛЬ", toCanvasX(targetPt.x - 14), toCanvasY(targetPt.y - 24));
+
+        // Motion physics
+        if (activeState === "motion" || activeState === "waiting_response") {
+          const elapsed = performance.now() - stateRef.current.startTime;
+          const elapsedFraction = Math.min(1.0, elapsed / totalMotionTimeMs);
+          const currentDistance = elapsedFraction * totalDistance;
+          const currentPos = stateRef.current.frozenPos || getPathPoint(segments, currentDistance);
+
+          // Render moving ball
+          const grad = ctx.createRadialGradient(
+            toCanvasX(currentPos.x),
+            toCanvasY(currentPos.y),
+            toCanvasSize(1),
+            toCanvasX(currentPos.x),
+            toCanvasY(currentPos.y),
+            toCanvasSize(18)
+          );
+          grad.addColorStop(0, "#FFFFFF");
+          grad.addColorStop(0.35, "#3B82F6");
+          grad.addColorStop(1, "rgba(59, 130, 246, 0)");
+
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(20), 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = "#FFFFFF";
+          ctx.strokeStyle = "#93C5FD";
+          ctx.lineWidth = toCanvasSize(2.5);
+          ctx.beginPath();
+          ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(11), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+
+          // If reached end of overshoot without press, automatically finish
+          if (elapsed >= totalMotionTimeMs && !stateRef.current.hasResponded) {
+            stateRef.current.hasResponded = true;
+            setTimeout(() => onTrialComplete(totalMotionTimeMs), 0);
+          }
+        }
+      }
+
+      // =========================================================================
+      // CONDITION 2: TTC (5.2.2 Оценка времени до столкновения через экран окклюзии)
+      // =========================================================================
+      else if (condition === ExperimentalMode.TTC) {
+        const targetTimeMs = 600 + duration;
+        const visibleFraction = 600 / targetTimeMs;
+        const visibleDistance = visibleFraction * totalDistance;
+
+        const startPt = getPathPoint(segments, 0);
+        const targetPt = getPathPoint(segments, totalDistance);
+
+        // Start marker
+        ctx.fillStyle = "#3B82F6";
+        ctx.fillRect(toCanvasX(startPt.x - 3), toCanvasY(startPt.y - 25), toCanvasSize(6), toCanvasSize(50));
+        ctx.font = `bold ${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+        ctx.fillText("СТАРТ", toCanvasX(startPt.x - 18), toCanvasY(startPt.y - 32));
+
+        // Visible trajectory section
+        ctx.strokeStyle = "#3B82F6";
+        ctx.fillStyle = "#60A5FA";
+        ctx.lineWidth = toCanvasSize(3.2);
+        drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, 0, visibleDistance);
+
+        // Bounding box of occluded zone in virtual coordinates
+        const occludedPoints: Point[] = [];
+        for (let d = visibleDistance; d <= totalDistance; d += 6) {
+          occludedPoints.push(getPathPoint(segments, d));
+        }
+        occludedPoints.push(targetPt);
+
+        const xs = occludedPoints.map((p) => p.x);
+        const ys = occludedPoints.map((p) => p.y);
+        const minX = Math.max(10, Math.min(...xs) - 30);
+        const maxX = Math.min(690, Math.max(...xs) + 30);
+        const minY = Math.max(10, Math.min(...ys) - 35);
+        const maxY = Math.min(390, Math.max(...ys) + 35);
+
+        const boxW = maxX - minX;
+        const boxH = maxY - minY;
+
+        // Draw Occlusion Screen
+        ctx.fillStyle = "rgba(11, 19, 43, 0.95)";
+        ctx.fillRect(toCanvasX(minX), toCanvasY(minY), toCanvasSize(boxW), toCanvasSize(boxH));
+
+        ctx.strokeStyle = "rgba(59, 130, 246, 0.7)";
+        ctx.lineWidth = toCanvasSize(1.5);
+        ctx.strokeRect(toCanvasX(minX), toCanvasY(minY), toCanvasSize(boxW), toCanvasSize(boxH));
+
+        // Occlusion Header Bar
+        ctx.fillStyle = "rgba(30, 58, 138, 0.7)";
+        ctx.fillRect(toCanvasX(minX), toCanvasY(minY), toCanvasSize(boxW), toCanvasSize(22));
+        ctx.strokeStyle = "rgba(59, 130, 246, 0.4)";
+        ctx.lineWidth = toCanvasSize(1);
+        ctx.strokeRect(toCanvasX(minX), toCanvasY(minY), toCanvasSize(boxW), toCanvasSize(22));
+
+        ctx.fillStyle = "#93C5FD";
+        ctx.font = `bold ${Math.round(toCanvasSize(10))}px "JetBrains Mono", monospace`;
+        ctx.fillText("ЗОНА ОККЛЮЗИИ (СКРЫТОЕ ДВИЖЕНИЕ)", toCanvasX(minX + 10), toCanvasY(minY + 15));
+
+        // Entry barrier
+        const occludeEntryPt = getPathPoint(segments, visibleDistance);
+        ctx.strokeStyle = "rgba(245, 158, 11, 0.85)";
+        ctx.lineWidth = toCanvasSize(2);
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(toCanvasX(occludeEntryPt.x), toCanvasY(occludeEntryPt.y - 20));
+        ctx.lineTo(toCanvasX(occludeEntryPt.x), toCanvasY(occludeEntryPt.y + 20));
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = "#FBBF24";
+        ctx.font = `bold ${Math.round(toCanvasSize(9))}px "JetBrains Mono", monospace`;
+        ctx.fillText("ВХОД", toCanvasX(occludeEntryPt.x - 12), toCanvasY(occludeEntryPt.y - 25));
+
+        // Dashed trajectory path inside occluder
+        ctx.strokeStyle = "rgba(147, 197, 253, 0.75)";
+        ctx.fillStyle = "#38BDF8";
+        ctx.lineWidth = toCanvasSize(2.2);
+        ctx.setLineDash([6, 6]);
+        drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, visibleDistance, totalDistance);
+        ctx.setLineDash([]);
+
+        // Intermediate guide dots
+        const occludedLength = totalDistance - visibleDistance;
+        const numSteps = Math.max(3, Math.floor(occludedLength / 35));
+        for (let s = 1; s <= numSteps; s++) {
+          const d = visibleDistance + s * (occludedLength / (numSteps + 1));
+          const pt = getPathPoint(segments, d);
+          ctx.fillStyle = "rgba(147, 197, 253, 0.85)";
+          ctx.strokeStyle = "rgba(15, 23, 42, 0.9)";
+          ctx.lineWidth = toCanvasSize(1.5);
+          ctx.beginPath();
+          ctx.arc(toCanvasX(pt.x), toCanvasY(pt.y), toCanvasSize(3.5), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+
+        // Target Finish Point
+        ctx.fillStyle = "#EF4444";
+        ctx.beginPath();
+        ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(12), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#FFFFFF";
+        ctx.lineWidth = toCanvasSize(2);
+        ctx.stroke();
+
+        ctx.fillStyle = "#FFFFFF";
+        ctx.beginPath();
+        ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(4), 0, Math.PI * 2);
         ctx.fill();
 
         ctx.strokeStyle = "rgba(239, 68, 68, 0.9)";
-        ctx.lineWidth = 2 * scaleX;
+        ctx.lineWidth = toCanvasSize(1.5);
         ctx.beginPath();
-        ctx.moveTo((targetPt.x - 22) * scaleX, targetPt.y * scaleY);
-        ctx.lineTo((targetPt.x + 22) * scaleX, targetPt.y * scaleY);
-        ctx.moveTo(targetPt.x * scaleX, (targetPt.y - 22) * scaleY);
-        ctx.lineTo(targetPt.x * scaleX, (targetPt.y + 22) * scaleY);
+        ctx.moveTo(toCanvasX(targetPt.x - 18), toCanvasY(targetPt.y));
+        ctx.lineTo(toCanvasX(targetPt.x + 18), toCanvasY(targetPt.y));
+        ctx.moveTo(toCanvasX(targetPt.x), toCanvasY(targetPt.y - 18));
+        ctx.lineTo(toCanvasX(targetPt.x), toCanvasY(targetPt.y + 18));
         ctx.stroke();
 
         ctx.fillStyle = "#F87171";
-        ctx.font = `bold ${12 * scaleY}px "JetBrains Mono", sans-serif`;
-        ctx.fillText("ЦЕЛЬ", (targetPt.x - 18) * scaleX, (targetPt.y - 26) * scaleY);
+        ctx.font = `bold ${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+        ctx.fillText("ЦЕЛЬ", toCanvasX(targetPt.x - 14), toCanvasY(targetPt.y - 22));
 
-        // 6. Motion execution & stimulus orb rendering
+        // Motion physics
         if (activeState === "motion" || activeState === "occluded" || activeState === "waiting_response") {
           const elapsed = performance.now() - stateRef.current.startTime;
-          const totalTime = 600 + duration;
-          const elapsedDistance = Math.min(totalDistance, (elapsed / totalTime) * totalDistance);
-          const currentPos = getPathPoint(segments, elapsedDistance);
+          const currentDistance = Math.min(totalDistance, (elapsed / targetTimeMs) * totalDistance);
+          const currentPos = getPathPoint(segments, currentDistance);
 
-          // Transition to occluded when leaving open path
-          if (mode === ExperimentalMode.TTC && elapsedDistance >= visibleDistance && activeState === "motion") {
+          if (currentDistance >= visibleDistance && activeState === "motion") {
             setTimeout(() => setTrialState("occluded"), 0);
           }
 
-          // Transition to waiting response when trajectory ends
-          if (elapsed >= totalTime) {
-            if (activeState === "motion" || activeState === "occluded") {
-              stateRef.current.motionEndTime = performance.now();
-              setTimeout(() => setTrialState("waiting_response"), 0);
-            }
+          if (elapsed >= targetTimeMs && (activeState === "motion" || activeState === "occluded")) {
+            setTimeout(() => setTrialState("waiting_response"), 0);
           }
 
-          // Timeout in waiting_response if no key pressed within 10 seconds
-          if (activeState === "waiting_response") {
-            const waitTime = performance.now() - (stateRef.current.motionEndTime || performance.now());
-            if (waitTime > 10000 && !stateRef.current.hasResponded) {
-              stateRef.current.hasResponded = true;
-              setTimeout(() => onTrialComplete(totalTime + 3000), 0);
-            }
-          }
-
-          // Render moving stimulus ball ONLY if visible on open path
-          const isStimulusVisible = (activeState === "motion" && elapsedDistance <= visibleDistance) || 
-                                   (mode === ExperimentalMode.REACTION_VISIBLE);
-
-          if (isStimulusVisible) {
+          // Ball is ONLY visible before reaching occlusion entry
+          if (activeState === "motion" && currentDistance <= visibleDistance) {
             const grad = ctx.createRadialGradient(
-              currentPos.x * scaleX, currentPos.y * scaleY, 2 * scaleX,
-              currentPos.x * scaleX, currentPos.y * scaleY, 20 * scaleX
+              toCanvasX(currentPos.x),
+              toCanvasY(currentPos.y),
+              toCanvasSize(1),
+              toCanvasX(currentPos.x),
+              toCanvasY(currentPos.y),
+              toCanvasSize(18)
             );
             grad.addColorStop(0, "#FFFFFF");
             grad.addColorStop(0.35, "#3B82F6");
@@ -488,223 +532,325 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
 
             ctx.fillStyle = grad;
             ctx.beginPath();
-            ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 22 * scaleX, 0, Math.PI * 2);
+            ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(20), 0, Math.PI * 2);
             ctx.fill();
 
-            // Bold high-contrast core
             ctx.fillStyle = "#FFFFFF";
             ctx.strokeStyle = "#93C5FD";
-            ctx.lineWidth = 2.5 * scaleX;
+            ctx.lineWidth = toCanvasSize(2.5);
             ctx.beginPath();
-            ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 12 * scaleX, 0, Math.PI * 2);
+            ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(11), 0, Math.PI * 2);
             ctx.fill();
             ctx.stroke();
+          }
+
+          // Auto-timeout if user doesn't press space within +1800ms
+          if (elapsed >= targetTimeMs + 1800 && !stateRef.current.hasResponded) {
+            stateRef.current.hasResponded = true;
+            setTimeout(() => onTrialComplete(targetTimeMs + 1800), 0);
           }
         }
       }
 
-      else if (mode === ExperimentalMode.INTERVAL_REPRODUCTION) {
-        // Mode 3: Reproduce visible movement interval
-        // Draw track polyline for Interval Reproduction
-        ctx.strokeStyle = "rgba(80, 120, 255, 0.4)";
-        ctx.fillStyle = "#3B82F6";
-        ctx.lineWidth = 2.5;
-        drawPolyline(ctx, segments, curvePoints, scaleX, scaleY, 0, totalDistance);
+      // =========================================================================
+      // CONDITION 3: INTERVAL_REPRODUCTION (5.2.3 Отмеривание времени движения)
+      // =========================================================================
+      else if (condition === ExperimentalMode.INTERVAL_REPRODUCTION) {
+        if (activeState === "motion") {
+          // Part 1: Visible trajectory demonstration
+          ctx.strokeStyle = "rgba(80, 120, 255, 0.4)";
+          ctx.fillStyle = "#3B82F6";
+          ctx.lineWidth = toCanvasSize(2.5);
+          drawPolyline(ctx, segments, curvePoints, toCanvasX, toCanvasY, toCanvasSize, 0, totalDistance);
 
-        // Draw start line marker
-        const startPt = getPathPoint(segments, 0);
-        ctx.fillStyle = "#3B82F6";
-        ctx.fillRect((startPt.x - 2) * scaleX, (startPt.y - 30) * scaleY, 4 * scaleX, 60 * scaleY);
-        ctx.font = `${10 * scaleY}px "JetBrains Mono"`;
-        ctx.fillText("СТАРТ", (startPt.x - 18) * scaleX, (startPt.y - 40) * scaleY);
-        // There is reference phase, and response phase
-        const isDemo = activeState === "motion"; 
-        const isReprod = activeState === "waiting_response";
+          const startPt = getPathPoint(segments, 0);
+          ctx.fillStyle = "#3B82F6";
+          ctx.fillRect(toCanvasX(startPt.x - 2), toCanvasY(startPt.y - 25), toCanvasSize(4), toCanvasSize(50));
+          ctx.font = `bold ${Math.round(toCanvasSize(10))}px "JetBrains Mono", monospace`;
+          ctx.fillText("СТАРТ", toCanvasX(startPt.x - 16), toCanvasY(startPt.y - 32));
 
-        if (isDemo) {
-          const elapsed = performance.now() - stateRef.current.startTime;
-          const elapsedDistance = Math.min(totalDistance, (elapsed / duration) * totalDistance);
-          const currentPos = getPathPoint(segments, elapsedDistance);
-
-          // Auto stop demonstration and transition to waiting response
-          if (elapsed >= duration) {
-            setTimeout(() => {
-              logSystemMessage("Демонстрация целевого интервала завершена. Приготовьтесь повторить длительность (Нажмите ПРОБЕЛ, чтобы начать).");
-              setTrialState("waiting_response"); 
-            }, 0);
-          }
-
-          // Draw target ending marker of training demonstration
-          ctx.strokeStyle = "rgba(168, 85, 247, 0.4)";
-          ctx.setLineDash([3, 3]);
           const targetPt = getPathPoint(segments, totalDistance);
+          ctx.fillStyle = "#A855F7";
           ctx.beginPath();
-          ctx.moveTo(targetPt.x * scaleX, (targetPt.y - 40) * scaleY);
-          ctx.lineTo(targetPt.x * scaleX, (targetPt.y + 40) * scaleY);
+          ctx.arc(toCanvasX(targetPt.x), toCanvasY(targetPt.y), toCanvasSize(10), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = "#FFFFFF";
+          ctx.lineWidth = toCanvasSize(2);
           ctx.stroke();
-          ctx.setLineDash([]);
+          ctx.fillText("ФИНИШ", toCanvasX(targetPt.x - 18), toCanvasY(targetPt.y - 18));
 
-          // Draw moving stimulus dot (Purple)
+          const elapsed = performance.now() - stateRef.current.startTime;
+          const currentDistance = Math.min(totalDistance, (elapsed / duration) * totalDistance);
+          const currentPos = getPathPoint(segments, currentDistance);
+
+          // Moving sphere
           const grad = ctx.createRadialGradient(
-            currentPos.x * scaleX, currentPos.y * scaleY, 1 * scaleX,
-            currentPos.x * scaleX, currentPos.y * scaleY, 12 * scaleX
+            toCanvasX(currentPos.x),
+            toCanvasY(currentPos.y),
+            toCanvasSize(1),
+            toCanvasX(currentPos.x),
+            toCanvasY(currentPos.y),
+            toCanvasSize(16)
           );
           grad.addColorStop(0, "#FFFFFF");
-          grad.addColorStop(0.3, "#C084FC");
-          grad.addColorStop(1, "rgba(168, 85, 247, 0)");
+          grad.addColorStop(0.35, "#8B5CF6");
+          grad.addColorStop(1, "rgba(139, 92, 246, 0)");
           ctx.fillStyle = grad;
           ctx.beginPath();
-          ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 15 * scaleX, 0, Math.PI * 2);
+          ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(18), 0, Math.PI * 2);
           ctx.fill();
 
-          ctx.strokeStyle = "#D8B4FE";
-          ctx.lineWidth = 2;
+          ctx.fillStyle = "#FFFFFF";
+          ctx.strokeStyle = "#C4B5FD";
+          ctx.lineWidth = toCanvasSize(2.5);
           ctx.beginPath();
-          ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 8 * scaleX, 0, Math.PI * 2);
+          ctx.arc(toCanvasX(currentPos.x), toCanvasY(currentPos.y), toCanvasSize(10), 0, Math.PI * 2);
+          ctx.fill();
           ctx.stroke();
 
-          // Render Label
-          ctx.fillStyle = "#D8B4FE";
-          ctx.font = `11px "JetBrains Mono"`;
-          ctx.fillText("ДЕМОАКТИВНОСТЬ", 290 * scaleX, 50 * scaleY);
-        } 
-        
-        else if (isReprod) {
-          if (stateRef.current.reproActive) {
-            const elapsedRepro = performance.now() - stateRef.current.reproStartTime;
-            const elapsedDistance = Math.min(totalDistance, (elapsedRepro / duration) * totalDistance);
-            const currentPos = getPathPoint(segments, elapsedDistance);
+          // Title
+          ctx.fillStyle = "#C4B5FD";
+          ctx.font = `bold ${Math.round(toCanvasSize(12))}px "JetBrains Mono", monospace`;
+          ctx.fillText(`ЧАСТЬ 1: НАБЛЮДЕНИЕ ИНТЕРВАЛА (Ti = ${duration} мс)`, toCanvasX(140), toCanvasY(40));
 
-            // Draw moving stimulus dot (Blue during user reproduction)
-            const grad = ctx.createRadialGradient(
-              currentPos.x * scaleX, currentPos.y * scaleY, 1 * scaleX,
-              currentPos.x * scaleX, currentPos.y * scaleY, 12 * scaleX
-            );
-            grad.addColorStop(0, "#FFFFFF");
-            grad.addColorStop(0.3, "#3B82F6");
-            grad.addColorStop(1, "rgba(59, 130, 246, 0)");
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 15 * scaleX, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.strokeStyle = "#93C5FD";
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(currentPos.x * scaleX, currentPos.y * scaleY, 8 * scaleX, 0, Math.PI * 2);
-            ctx.stroke();
-
-            ctx.fillStyle = "#93C5FD";
-            ctx.font = `11px "JetBrains Mono"`;
-            ctx.fillText(`ВОСПРОИЗВЕДЕНИЕ ИНТЕРВАЛА... ПРОШЛО: ${elapsedRepro.toFixed(0)} мс (Нажмите ПРОБЕЛ для фиксации)`, 150 * scaleX, 50 * scaleY);
-
-            // Force auto-stop if timeout
-            if (elapsedRepro > 6000) {
-              stateRef.current.reproActive = false;
-              setTimeout(() => onTrialComplete(elapsedRepro), 0);
-            }
-          } else {
-            ctx.fillStyle = "#60A5FA";
-            ctx.font = `12px "JetBrains Mono"`;
-            ctx.fillText("Нажмите ПРОБЕЛ, чтобы начать воспроизведение интервала", 160 * scaleX, 200 * scaleY);
-          }
-        }
-      }
-
-      else if (mode === ExperimentalMode.DURATION_REPRODUCTION) {
-        // Mode 4: Standalone duration pulse demonstration & reproduction
-        const isDemo = activeState === "motion";
-        const isReprod = activeState === "waiting_response";
-
-        if (isDemo) {
-          const elapsed = performance.now() - stateRef.current.startTime;
-          
           if (elapsed >= duration) {
             setTimeout(() => {
-              logSystemMessage("Базовая презентация завершена. Приготовьтесь воспроизвести длительность (Зажмите ПРОБЕЛ).");
+              logSystemMessage("Эталон показан. Нажмите ПРОБЕЛ для старта отсчета, затем повторно ПРОБЕЛ для фиксации.");
               setTrialState("waiting_response");
             }, 0);
           }
+        } else if (activeState === "waiting_response") {
+          // Part 2: Centered Black Ball
+          const centerX = toCanvasX(350);
+          const centerY = toCanvasY(200);
+          const ballRadius = toCanvasSize(24);
 
-          // Render beautiful green time presentation circle in the middle
-          const pulseScale = 1 + 0.12 * Math.sin(performance.now() / 150);
-          const grad = ctx.createRadialGradient(
-            350 * scaleX, 200 * scaleY, 5 * scaleX,
-            350 * scaleX, 200 * scaleY, 60 * pulseScale * scaleX
-          );
-          grad.addColorStop(0, "#FFFFFF");
-          grad.addColorStop(0.4, "rgba(16, 185, 129, 0.45)");
-          grad.addColorStop(1, "rgba(16, 185, 129, 0)");
-          
-          ctx.fillStyle = grad;
-          ctx.beginPath();
-          ctx.arc(350 * scaleX, 200 * scaleY, 65 * pulseScale * scaleX, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.fillStyle = "#93C5FD";
+          ctx.font = `bold ${Math.round(toCanvasSize(13))}px "JetBrains Mono", monospace`;
+          ctx.fillText("ЧАСТЬ 2: ВОСПРОИЗВЕДЕНИЕ ИНТЕРВАЛА", toCanvasX(210), toCanvasY(50));
 
-          ctx.strokeStyle = "#6EE7B7";
-          ctx.lineWidth = 3;
-          ctx.beginPath();
-          ctx.arc(350 * scaleX, 200 * scaleY, 30 * scaleX, 0, Math.PI * 2);
-          ctx.stroke();
-
-          ctx.fillStyle = "#A7F3D0";
-          ctx.font = `12px "JetBrains Mono"`;
-          ctx.fillText("ПОКАЗ ЭТАЛОННОЙ ДЛИТЕЛЬНОСТИ АКТИВЕН", 220 * scaleX, 290 * scaleY);
-          ctx.fillText(`${elapsed.toFixed(0)} мс / ${duration} мс`, 300 * scaleX, 120 * scaleY);
-        }
-
-        else if (isReprod) {
           if (stateRef.current.reproActive) {
             const elapsedRepro = performance.now() - stateRef.current.reproStartTime;
 
-            // Draw user holding pulse circle in golden gold
-            const pulseScale = 1 + 0.08 * Math.sin(performance.now() / 100);
-            const grad = ctx.createRadialGradient(
-              350 * scaleX, 200 * scaleY, 5 * scaleX,
-              350 * scaleX, 200 * scaleY, 45 * pulseScale * scaleX
-            );
-            grad.addColorStop(0, "#FFFFFF");
-            grad.addColorStop(0.4, "rgba(245, 158, 11, 0.45)");
-            grad.addColorStop(1, "rgba(245, 158, 11, 0)");
-            
-            ctx.fillStyle = grad;
+            const pulse = 1 + 0.08 * Math.sin(performance.now() / 120);
+            ctx.strokeStyle = "#38BDF8";
+            ctx.lineWidth = toCanvasSize(3);
             ctx.beginPath();
-            ctx.arc(350 * scaleX, 200 * scaleY, 50 * pulseScale * scaleX, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.strokeStyle = "#FCD34D";
-            ctx.lineWidth = 3;
-            ctx.beginPath();
-            ctx.arc(350 * scaleX, 200 * scaleY, 25 * scaleX, 0, Math.PI * 2);
+            ctx.arc(centerX, centerY, (ballRadius + toCanvasSize(10)) * pulse, 0, Math.PI * 2);
             ctx.stroke();
 
-            ctx.fillStyle = "#FDE68A";
-            ctx.font = `12px "JetBrains Mono"`;
-            ctx.fillText("УДЕРЖИВАЙТЕ ПРОБЕЛ ДЛЯ ВОСПРОИЗВЕДЕНИЯ", 220 * scaleX, 290 * scaleY);
-            ctx.fillText(`${elapsedRepro.toFixed(0)} мс`, 320 * scaleX, 120 * scaleY);
+            // Black ball with white border
+            ctx.fillStyle = "#0A0F1D";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, ballRadius, 0, Math.PI * 2);
+            ctx.fill();
 
-            if (elapsedRepro > 6000) {
+            ctx.strokeStyle = "#FFFFFF";
+            ctx.lineWidth = toCanvasSize(3);
+            ctx.stroke();
+
+            ctx.fillStyle = "#38BDF8";
+            ctx.font = `bold ${Math.round(toCanvasSize(14))}px "JetBrains Mono", monospace`;
+            ctx.fillText(
+              `ИДЁТ ОТСЧЁТ: ${(elapsedRepro / 1000).toFixed(2)} с (${elapsedRepro.toFixed(0)} мс)`,
+              toCanvasX(200),
+              toCanvasY(320)
+            );
+            ctx.fillStyle = "#94A3B8";
+            ctx.font = `${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+            ctx.fillText("[ Нажмите ПРОБЕЛ для фиксации окончания интервала ]", toCanvasX(150), toCanvasY(350));
+
+            if (elapsedRepro > 8000) {
               stateRef.current.reproActive = false;
               setTimeout(() => onTrialComplete(elapsedRepro), 0);
             }
           } else {
-            ctx.fillStyle = "#FBBF24";
-            ctx.font = `12px "JetBrains Mono"`;
-            ctx.fillText("ЗАЖМИТЕ И УДЕРЖИВАЙТЕ ПРОБЕЛ для воспроизведения длительности", 120 * scaleX, 200 * scaleY);
+            // Idle Black Ball waiting for start
+            ctx.fillStyle = "#0A0F1D";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, ballRadius, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = "#FFFFFF";
+            ctx.lineWidth = toCanvasSize(3);
+            ctx.stroke();
+
+            ctx.fillStyle = "#60A5FA";
+            ctx.font = `bold ${Math.round(toCanvasSize(12))}px "JetBrains Mono", monospace`;
+            ctx.fillText(
+              "Нажмите ПРОБЕЛ для старта отсчета, затем повторно ПРОБЕЛ для фиксации",
+              toCanvasX(100),
+              toCanvasY(320)
+            );
           }
         }
       }
 
-      // Render trial overlay info
+      // =========================================================================
+      // CONDITION 4: DURATION_REPRODUCTION (5.2.4 Воспроизведение длительности свечения фигуры)
+      // Phase 1: Glowing luminous figure shown for Ti (800, 1700, 3100 ms)
+      // Phase 2: Hold Spacebar / Button for the same duration, release when done
+      // =========================================================================
+      else if (condition === ExperimentalMode.DURATION_REPRODUCTION) {
+        const centerX = toCanvasX(350);
+        const centerY = toCanvasY(200);
+
+        if (activeState === "motion") {
+          const elapsed = performance.now() - stateRef.current.startTime;
+
+          // Single Glowing Radiant Figure
+          const orbRadius = toCanvasSize(28);
+          const pulse = 1 + 0.05 * Math.sin(performance.now() / 150);
+
+          // Outer aura glow
+          const grad = ctx.createRadialGradient(
+            centerX,
+            centerY,
+            toCanvasSize(2),
+            centerX,
+            centerY,
+            orbRadius * 2.2 * pulse
+          );
+          grad.addColorStop(0, "rgba(255, 255, 255, 1)");
+          grad.addColorStop(0.25, "rgba(16, 185, 129, 0.95)");
+          grad.addColorStop(0.6, "rgba(5, 150, 105, 0.4)");
+          grad.addColorStop(1, "rgba(16, 185, 129, 0)");
+
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, orbRadius * 2.2 * pulse, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Inner solid glowing circle
+          ctx.fillStyle = "#10B981";
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, orbRadius, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.strokeStyle = "#A7F3D0";
+          ctx.lineWidth = toCanvasSize(3);
+          ctx.stroke();
+
+          // Center bright core
+          ctx.fillStyle = "#FFFFFF";
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, orbRadius * 0.4, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Title & Presentation timer
+          ctx.fillStyle = "#6EE7B7";
+          ctx.font = `bold ${Math.round(toCanvasSize(13))}px "JetBrains Mono", monospace`;
+          ctx.fillText(`ЭТАЛОН СВЕЧЕНИЯ ФИГУРЫ (Ti = ${duration} мс)`, toCanvasX(170), toCanvasY(50));
+          ctx.fillStyle = "#A7F3D0";
+          ctx.font = `${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+          ctx.fillText(`Запоминайте время свечения фигуры...`, toCanvasX(210), toCanvasY(320));
+
+          if (elapsed >= duration) {
+            setTimeout(() => {
+              logSystemMessage("Эталон завершен. Зажмите и удерживайте ПРОБЕЛ на такую же длительность, затем отпустите.");
+              setTrialState("waiting_response");
+            }, 0);
+          }
+        } else if (activeState === "waiting_response") {
+          const orbRadius = toCanvasSize(28);
+
+          ctx.fillStyle = "#FBBF24";
+          ctx.font = `bold ${Math.round(toCanvasSize(13))}px "JetBrains Mono", monospace`;
+          ctx.fillText("ВОСПРОИЗВЕДЕНИЕ ДЛИТЕЛЬНОСТИ", toCanvasX(210), toCanvasY(50));
+
+          if (stateRef.current.isHoldingSpace) {
+            // Actively being held down
+            const elapsedHold = performance.now() - stateRef.current.holdStartTime;
+            const pulse = 1 + 0.08 * Math.sin(performance.now() / 100);
+
+            // Active golden radiant glow
+            const grad = ctx.createRadialGradient(
+              centerX,
+              centerY,
+              toCanvasSize(2),
+              centerX,
+              centerY,
+              orbRadius * 2.2 * pulse
+            );
+            grad.addColorStop(0, "rgba(255, 255, 255, 1)");
+            grad.addColorStop(0.3, "rgba(245, 158, 11, 0.95)");
+            grad.addColorStop(0.7, "rgba(217, 119, 6, 0.4)");
+            grad.addColorStop(1, "rgba(245, 158, 11, 0)");
+
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, orbRadius * 2.2 * pulse, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.fillStyle = "#F59E0B";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, orbRadius, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = "#FEF3C7";
+            ctx.lineWidth = toCanvasSize(3);
+            ctx.stroke();
+
+            ctx.fillStyle = "#FFFFFF";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, orbRadius * 0.4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Active elapsed counter
+            ctx.fillStyle = "#FBBF24";
+            ctx.font = `bold ${Math.round(toCanvasSize(14))}px "JetBrains Mono", monospace`;
+            ctx.fillText(
+              `УДЕРЖАНИЕ: ${(elapsedHold / 1000).toFixed(2)} с (${elapsedHold.toFixed(0)} мс)`,
+              toCanvasX(200),
+              toCanvasY(320)
+            );
+            ctx.fillStyle = "#94A3B8";
+            ctx.font = `${Math.round(toCanvasSize(11))}px "JetBrains Mono", monospace`;
+            ctx.fillText("[ Отпустите ПРОБЕЛ для завершения ]", toCanvasX(200), toCanvasY(350));
+
+            // Safety limit
+            if (elapsedHold > 8000) {
+              stateRef.current.isHoldingSpace = false;
+              setIsHoldingState(false);
+              setTimeout(() => onTrialComplete(elapsedHold), 0);
+            }
+          } else {
+            // Resting state waiting for user to hold space
+            ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, orbRadius, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = "rgba(245, 158, 11, 0.7)";
+            ctx.lineWidth = toCanvasSize(2.5);
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, orbRadius, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = "#FDE68A";
+            ctx.font = `bold ${Math.round(toCanvasSize(12))}px "JetBrains Mono", monospace`;
+            ctx.fillText(
+              "Зажмите и УДЕРЖИВАЙТЕ ПРОБЕЛ на такую же длительность, затем отпустите",
+              toCanvasX(60),
+              toCanvasY(320)
+            );
+          }
+        }
+      }
+
+      // Blank delay screen
       if (activeState === "blank_delay") {
         ctx.fillStyle = "rgba(10, 20, 30, 0.85)";
         ctx.fillRect(0, 0, w, h);
-        
+
         ctx.fillStyle = "#F59E0B";
-        ctx.font = `14px "JetBrains Mono"`;
-        ctx.fillText("➕ ПАУЗА ПЕРЕД СИГНАЛОМ (ФОКУСИРУЙТЕСЬ)", 180 * scaleX, 200 * scaleY);
+        ctx.font = `bold ${Math.round(toCanvasSize(13))}px "JetBrains Mono", monospace`;
+        ctx.fillText("➕ ПАУЗА ПЕРЕД СИГНАЛОМ (ФОКУСИРУЙТЕСЬ)", toCanvasX(170), toCanvasY(200));
       }
 
+      ctx.restore();
       animationId = requestAnimationFrame(render);
     };
 
@@ -713,143 +859,136 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
     return () => {
       cancelAnimationFrame(animationId);
     };
-  }, [onTrialComplete, isPaused, setTrialState]);
+  }, [onTrialComplete, isPaused, setTrialState, logSystemMessage]);
 
+  // Start trial handler
+  const startTrial = useCallback(() => {
+    setTrialState("blank_delay");
+    stateRef.current.frozenPos = null;
+    stateRef.current.hasResponded = false;
+    stateRef.current.reproActive = false;
+    stateRef.current.isHoldingSpace = false;
+    setIsHoldingState(false);
 
-  // Keydown and Keyup input handling targeting spacebar
+    const delay = 200 + Math.random() * 300;
+    setTimeout(() => {
+      setTrialState("motion");
+      stateRef.current.startTime = performance.now();
+    }, delay);
+  }, [setTrialState]);
+
+  // Handle Space Down / Hold Start
+  const handleKeyDownAction = useCallback(() => {
+    const activeState = stateRef.current.activeTrialState;
+    const condition = stateRef.current.activeTrialCondition;
+
+    // 1. Kick off trial from idle
+    if (activeState === "idle") {
+      startTrial();
+      return;
+    }
+
+    // 2. Space action for REACTION_VISIBLE & TTC (Single instantaneous click / press)
+    if (activeState === "motion" || activeState === "occluded" || activeState === "waiting_response") {
+      if (condition === ExperimentalMode.REACTION_VISIBLE || condition === ExperimentalMode.TTC) {
+        if (stateRef.current.hasResponded) return;
+        stateRef.current.hasResponded = true;
+        const elapsed = performance.now() - stateRef.current.startTime;
+
+        // Calculate frozen position on curve
+        const duration = stateRef.current.activeDuration;
+        const curveIndex = Math.abs(stateRef.current.activeTrajectoryIndex ?? 0) % UNIQUE_CURVES.length;
+        const segments = pointsToSegments(UNIQUE_CURVES[curveIndex]);
+        const totalDistance = getTotalDistance(segments);
+
+        if (condition === ExperimentalMode.REACTION_VISIBLE) {
+          const totalMotionTimeMs = 600 + duration + 900;
+          const currentDistance = Math.min(totalDistance, (elapsed / totalMotionTimeMs) * totalDistance);
+          stateRef.current.frozenPos = getPathPoint(segments, currentDistance);
+        }
+
+        onTrialComplete(elapsed);
+        return;
+      }
+    }
+
+    // 3. Space action for INTERVAL_REPRODUCTION (1st press = start, 2nd press = stop)
+    if (activeState === "waiting_response" && condition === ExperimentalMode.INTERVAL_REPRODUCTION) {
+      if (!stateRef.current.reproActive) {
+        stateRef.current.reproActive = true;
+        stateRef.current.reproStartTime = performance.now();
+        logSystemMessage("Отсчет интервала запущен. Нажмите ПРОБЕЛ для фиксации окончания.");
+      } else {
+        stateRef.current.reproActive = false;
+        stateRef.current.hasResponded = true;
+        const elapsed = performance.now() - stateRef.current.reproStartTime;
+        logSystemMessage(`Интервал зафиксирован: ${elapsed.toFixed(0)} мс`);
+        onTrialComplete(elapsed);
+      }
+      return;
+    }
+
+    // 4. Space action for DURATION_REPRODUCTION (Hold down space)
+    if (activeState === "waiting_response" && condition === ExperimentalMode.DURATION_REPRODUCTION) {
+      if (!stateRef.current.isHoldingSpace) {
+        stateRef.current.isHoldingSpace = true;
+        stateRef.current.holdStartTime = performance.now();
+        setIsHoldingState(true);
+      }
+    }
+  }, [startTrial, onTrialComplete, logSystemMessage]);
+
+  // Handle Space Up / Hold Release (Condition 4)
+  const handleKeyUpAction = useCallback(() => {
+    const activeState = stateRef.current.activeTrialState;
+    const condition = stateRef.current.activeTrialCondition;
+
+    if (activeState === "waiting_response" && condition === ExperimentalMode.DURATION_REPRODUCTION) {
+      if (stateRef.current.isHoldingSpace) {
+        stateRef.current.isHoldingSpace = false;
+        setIsHoldingState(false);
+        const holdDuration = performance.now() - stateRef.current.holdStartTime;
+        stateRef.current.hasResponded = true;
+        logSystemMessage(`Длительность удержания: ${holdDuration.toFixed(0)} мс`);
+        onTrialComplete(holdDuration);
+      }
+    }
+  }, [onTrialComplete, logSystemMessage]);
+
+  // Global Keyboard Event Listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code !== "Space" && e.key !== " ") return;
-      
-      // Stop space key from scrolling the web frame
       e.preventDefault();
-
       if (e.repeat) return;
-
-      const activeState = stateRef.current.activeTrialState;
-      const mode = stateRef.current.activeTrialCondition;
-      const duration = stateRef.current.activeDuration;
-
-      // Handle trial kickoff
-      if (activeState === "idle") {
-        setTrialState("blank_delay");
-        const delay = 200 + Math.random() * 300; // 0.2s - 0.5s delay
-        setTimeout(() => {
-          setTrialState("motion");
-          stateRef.current.startTime = performance.now();
-          stateRef.current.hasResponded = false;
-          stateRef.current.reproActive = false;
-        }, delay);
-        return;
-      }
-
-      // Intercept active visible motion (Mode 1), target collision (Mode 2), or waiting response
-      if (activeState === "motion" || activeState === "occluded" || activeState === "waiting_response") {
-        if (mode === ExperimentalMode.REACTION_VISIBLE || mode === ExperimentalMode.TTC) {
-          if (stateRef.current.hasResponded) return;
-          stateRef.current.hasResponded = true;
-          const elapsed = performance.now() - stateRef.current.startTime;
-          onTrialComplete(elapsed);
-          return;
-        }
-      }
-
-      // Capture interval reproductions
-      if (activeState === "waiting_response") {
-        if (mode === ExperimentalMode.INTERVAL_REPRODUCTION) {
-          if (!stateRef.current.reproActive) {
-            stateRef.current.reproActive = true;
-            stateRef.current.reproStartTime = performance.now();
-            logSystemMessage("Запущено воспроизведение интервала. Нажмите пробел еще раз для фиксации.");
-          } else {
-            stateRef.current.reproActive = false;
-            const elapsed = performance.now() - stateRef.current.reproStartTime;
-            stateRef.current.hasResponded = true;
-            onTrialComplete(elapsed);
-          }
-        } else if (mode === ExperimentalMode.DURATION_REPRODUCTION) {
-          if (!stateRef.current.reproActive && !stateRef.current.hasResponded) {
-            stateRef.current.reproActive = true;
-            stateRef.current.reproStartTime = performance.now();
-            logSystemMessage("Начало удержания сигнала...");
-          }
-        }
-      }
+      handleKeyDownAction();
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.code !== "Space" && e.key !== " ") return;
-
-      const activeState = stateRef.current.activeTrialState;
-      const mode = stateRef.current.activeTrialCondition;
-
-      if (activeState === "waiting_response" && mode === ExperimentalMode.DURATION_REPRODUCTION) {
-        if (stateRef.current.reproActive) {
-          stateRef.current.reproActive = false;
-          stateRef.current.hasResponded = true;
-          const elapsedRepro = performance.now() - stateRef.current.reproStartTime;
-          onTrialComplete(elapsedRepro);
-          logSystemMessage(`Окончание удержания сигнала. Длительность: ${elapsedRepro.toFixed(0)} мс`);
-        }
-      }
+      e.preventDefault();
+      handleKeyUpAction();
     };
 
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
+
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [onTrialComplete, setTrialState, logSystemMessage]);
-
-  const triggerSpaceBackup = () => {
-    const activeState = stateRef.current.activeTrialState;
-    const mode = stateRef.current.activeTrialCondition;
-
-    if (activeState === "idle") {
-      setTrialState("blank_delay");
-      const delay = 200 + Math.random() * 300;
-      setTimeout(() => {
-        setTrialState("motion");
-        stateRef.current.startTime = performance.now();
-        stateRef.current.hasResponded = false;
-        stateRef.current.reproActive = false;
-      }, delay);
-    } 
-    else if (activeState === "motion" || activeState === "occluded" || activeState === "waiting_response") {
-      if (mode === ExperimentalMode.REACTION_VISIBLE || mode === ExperimentalMode.TTC) {
-        if (stateRef.current.hasResponded) return;
-        stateRef.current.hasResponded = true;
-        const elapsed = performance.now() - stateRef.current.startTime;
-        onTrialComplete(elapsed);
-        return;
-      }
-      
-      if (mode === ExperimentalMode.INTERVAL_REPRODUCTION || mode === ExperimentalMode.DURATION_REPRODUCTION) {
-        if (!stateRef.current.reproActive) {
-          stateRef.current.reproActive = true;
-          stateRef.current.reproStartTime = performance.now();
-          logSystemMessage("Клик-старт воспроизведения интервала. Кликните еще раз для фиксации.");
-        } else {
-          stateRef.current.reproActive = false;
-          stateRef.current.hasResponded = true;
-          const elapsedRepro = performance.now() - stateRef.current.reproStartTime;
-          onTrialComplete(elapsedRepro);
-        }
-      }
-    }
-  };
+  }, [handleKeyDownAction, handleKeyUpAction]);
 
   return (
     <div className="relative w-full h-full flex flex-col items-center justify-between">
-      {/* Visual Instruction box based on state of current trial */}
-      <div className="absolute top-4 left-4 right-4 flex justify-between items-center px-4 py-2 bg-[#0F1B2D]/90 border border-blue-500/20 rounded shadow-md z-10 backdrop-blur-md">
+      {/* Top Banner */}
+      <div className="w-full flex justify-between items-center px-4 py-2 bg-[#0F1B2D]/90 border border-blue-500/20 rounded-t-lg shadow-md z-10 backdrop-blur-md mb-2">
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
           <span className="text-xs font-mono text-gray-400">ЭТАП:</span>
           <span className="text-xs font-bold font-mono text-blue-400 uppercase">{activeTrialState}</span>
         </div>
-        
+
         <div className="text-right">
           <span className="text-xs font-mono text-gray-400 mr-2">УСЛОВИЕ:</span>
           <span className="text-xs font-bold font-mono text-cyan-400">
@@ -858,52 +997,81 @@ export default function ExperimentCanvas({ onTrialComplete }: ExperimentCanvasPr
         </div>
       </div>
 
-      {/* Main stim canvas wrapper */}
-      <div className="w-full h-[320px] bg-[#050B17] rounded-lg overflow-hidden border border-[rgba(80,120,255,0.15)] flex justify-center items-center">
-        <canvas 
-          ref={canvasRef} 
-          className="w-full h-full block cursor-pointer" 
-          onClick={triggerSpaceBackup}
-          title="Нажмите на экран как альтернативу клавише Пробел"
-        />
+      {/* Main Canvas Stage */}
+      <div
+        className="w-full h-[320px] sm:h-[350px] bg-[#050B17] rounded-lg overflow-hidden border border-[rgba(80,120,255,0.15)] flex justify-center items-center relative select-none"
+        onMouseDown={handleKeyDownAction}
+        onMouseUp={handleKeyUpAction}
+        onTouchStart={handleKeyDownAction}
+        onTouchEnd={handleKeyUpAction}
+      >
+        <canvas ref={canvasRef} className="w-full h-full block cursor-pointer" />
       </div>
 
-      {/* Action Helper UI Panel */}
-      <div className="w-full py-4 px-2 flex flex-col items-center gap-2">
+      {/* Helper Interaction Controls */}
+      <div className="w-full py-3 px-2 flex flex-col items-center gap-2">
         {activeTrialState === "idle" && (
-          <div className="text-center animate-pulse">
-            <p className="text-sm text-gray-300 font-medium">
-              [ Нажмите <span className="px-3 py-1 bg-[#1E293B] border border-blue-500 text-white rounded font-mono font-bold text-xs select-none">ПРОБЕЛ</span> или область экрана для запуска попытки ]
-            </p>
-            <p className="text-xs text-gray-500 mt-1 font-mono">
-              Шар начнет движение после случайной паузы в 200–500 мс
-            </p>
-          </div>
+          <button
+            onClick={startTrial}
+            className="w-full max-w-md py-2.5 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-mono font-bold text-xs rounded-lg shadow-lg shadow-blue-500/20 flex items-center justify-center gap-2 transition-all cursor-pointer animate-pulse"
+          >
+            <span>[ НАЖМИТЕ ПРОБЕЛ ИЛИ ЗДЕСЬ ДЛЯ ЗАПУСКА ПРОБЫ ]</span>
+          </button>
         )}
 
-        {(activeTrialState === "motion" || activeTrialState === "occluded" || activeTrialState === "waiting_response") && (
+        {(activeTrialState === "motion" || activeTrialState === "occluded") && (
           <div className="text-center">
-            <button 
-              onClick={triggerSpaceBackup}
-              className="px-6 py-2 bg-rose-600 hover:bg-rose-500 focus:outline-none text-white text-xs font-bold tracking-wider font-mono uppercase rounded-full shadow-lg border border-rose-400/20 active:scale-95 transition-all select-none"
-            >
-              {activeTrialCondition === ExperimentalMode.REACTION_VISIBLE && "🎯 НАЖМИТЕ ПРОБЕЛ (ДЕЖУРНАЯ СКВУШ-КНОПКА)"}
-              {activeTrialCondition === ExperimentalMode.TTC && "🎯 НАЖМИТЕ ПРОБЕЛ ПРИ СТОЛКНОВЕНИИ"}
-              {activeTrialCondition === ExperimentalMode.INTERVAL_REPRODUCTION && "🎯 ПРОБЕЛ ДЛЯ СТАРТА / СТОПА ВОСПРОИЗВЕДЕНИЯ"}
-              {activeTrialCondition === ExperimentalMode.DURATION_REPRODUCTION && "🎯 ЗАЖМИТЕ И УДЕРЖИВАЙТЕ ПРОБЕЛ ДЛЯ ВОСПРОИЗВЕДЕНИЯ"}
-            </button>
-            <p className="text-xs text-gray-400 mt-1 font-mono">
-              {activeTrialCondition === ExperimentalMode.REACTION_VISIBLE && "Зафиксируйте реакцию немедленно при появлении стимула."}
-              {activeTrialCondition === ExperimentalMode.TTC && "Оцените момент времени, когда шар долетит до вертикальной полосы."}
-              {activeTrialCondition === ExperimentalMode.INTERVAL_REPRODUCTION && "Нажмите пробел чтобы начать движение шара, и нажмите пробел второй раз в целевой точке."}
-              {activeTrialCondition === ExperimentalMode.DURATION_REPRODUCTION && "Удерживайте пробел нажатым ровно такое же время, какое горел зеленый круг."}
-            </p>
+            {activeTrialCondition === ExperimentalMode.REACTION_VISIBLE && (
+              <p className="text-sm text-blue-300 font-medium">
+                Поймайте шар в целевой точке нажатием <span className="px-2 py-0.5 bg-blue-900/60 border border-blue-400 text-white rounded font-mono text-xs">ПРОБЕЛ</span> (шар продолжает движение дальше цели)
+              </p>
+            )}
+            {activeTrialCondition === ExperimentalMode.TTC && (
+              <p className="text-sm text-amber-300 font-medium">
+                Оцените момент столкновения с целью и нажмите <span className="px-2 py-0.5 bg-amber-900/60 border border-amber-400 text-white rounded font-mono text-xs">ПРОБЕЛ</span>
+              </p>
+            )}
+            {activeTrialCondition === ExperimentalMode.INTERVAL_REPRODUCTION && (
+              <p className="text-sm text-purple-300 font-medium">
+                Запоминайте интервал движения стимула по траектории...
+              </p>
+            )}
+            {activeTrialCondition === ExperimentalMode.DURATION_REPRODUCTION && (
+              <p className="text-sm text-emerald-300 font-medium">
+                Запоминайте длительность свечения фигуры...
+              </p>
+            )}
           </div>
         )}
 
-        {isPaused && (
-          <div className="text-center text-yellow-500 font-bold text-sm">
-            ⏸️ ЭКСПЕРИМЕНТАЛЬНАЯ СЕССИЯ ПРИОСТАНОВЛЕНА ИССЛЕДОВАТЕЛЕМ
+        {activeTrialState === "waiting_response" && (
+          <div className="w-full max-w-md flex flex-col items-center gap-2">
+            {activeTrialCondition === ExperimentalMode.DURATION_REPRODUCTION ? (
+              <button
+                onMouseDown={handleKeyDownAction}
+                onMouseUp={handleKeyUpAction}
+                onTouchStart={handleKeyDownAction}
+                onTouchEnd={handleKeyUpAction}
+                className={`w-full py-3 px-4 font-mono font-bold text-xs rounded-lg border transition-all select-none cursor-pointer ${
+                  isHoldingState
+                    ? "bg-amber-600 border-amber-400 text-white shadow-[0_0_20px_rgba(245,158,11,0.5)] scale-[0.99]"
+                    : "bg-[#111e38] border-amber-500/40 text-amber-300 hover:border-amber-400"
+                }`}
+              >
+                {isHoldingState
+                  ? "● УДЕРЖИВАЕТСЯ... ОТПУСТИТЕ ДЛЯ ЗАВЕРШЕНИЯ"
+                  : "ЗАЖМИТЕ И УДЕРЖИВАЙТЕ ПРОБЕЛ (ИЛИ ЭТУ КНОПКУ) НА ТАКУЮ ЖЕ ДЛИТЕЛЬНОСТЬ"}
+              </button>
+            ) : activeTrialCondition === ExperimentalMode.INTERVAL_REPRODUCTION ? (
+              <button
+                onClick={handleKeyDownAction}
+                className="w-full py-2.5 px-4 bg-[#111e38] border border-blue-500/40 hover:border-blue-400 text-cyan-300 font-mono font-bold text-xs rounded-lg shadow-md transition-all cursor-pointer"
+              >
+                {stateRef.current.reproActive
+                  ? "ОТСЧЕТ ИДЕТ... НАЖМИТЕ ПРОБЕЛ ДЛЯ ФИКСАЦИИ"
+                  : "НАЖМИТЕ ПРОБЕЛ ДЛЯ СТАРТА ОТСЧЕТА"}
+              </button>
+            ) : null}
           </div>
         )}
       </div>

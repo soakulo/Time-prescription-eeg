@@ -108,7 +108,9 @@ const DEFAULT_CONFIG: AppConfig = {
   blocks: 5,
   durations: [800, 1700, 3100],
   speeds: [300, 500],
-  trainingTrialsCount: 5,
+  trainingTrialsCount: 24, // Section 5.3: 6 condition trials + 18 randomized practice trials
+  trialsPerBlock: 84,      // Section 5.3: 420 trials / 5 blocks = 84 trials per block
+  protocolMode: "full_tz",
   feedbackEnabled: true,
   eegEnabled: true,
   eegInterface: "LSL",
@@ -125,11 +127,11 @@ const determineTrialCondition = (mode: ExperimentalMode, isTraining: boolean, tr
   if (isTraining) {
     if (trainingIndex < 6) {
       if (mode === ExperimentalMode.MIXED) {
-        return STANDARD_CONDITIONS[Math.floor(Math.random() * STANDARD_CONDITIONS.length)];
+        return STANDARD_CONDITIONS[trainingIndex % STANDARD_CONDITIONS.length];
       }
       return mode;
     } else {
-      // 18 randomized practice trials
+      // 18 randomized practice trials (all 4 conditions mixed with feedback)
       return STANDARD_CONDITIONS[Math.floor(Math.random() * STANDARD_CONDITIONS.length)];
     }
   } else {
@@ -420,7 +422,7 @@ export const useLabStore = create<LiveState & ActionState>((set, get) => ({
     const { isTraining, trainingTrialIndex, currentMode, currentTrial, config, currentBlock, activeTrajectoryIndex, logSystemMessage } = get();
 
     if (isTraining) {
-      const maxTraining = config.trainingTrialsCount || 5;
+      const maxTraining = config.trainingTrialsCount || 24;
       if (trainingTrialIndex >= maxTraining) {
         // Practice phase complete, prompt to proceed
         get().setTrialState("block_completed"); // Shows practice completed screen
@@ -440,9 +442,8 @@ export const useLabStore = create<LiveState & ActionState>((set, get) => ({
         get().setTrialState("idle");
       }
     } else {
-      // 10 trials per block for research speed
-      const TRIALS_PER_BLOCK = 10;
-      if (currentTrial >= TRIALS_PER_BLOCK) {
+      const trialsPerBlock = config.trialsPerBlock || (config.protocolMode === "quick" ? 10 : 84);
+      if (currentTrial >= trialsPerBlock) {
         // Current block completed
         if (currentBlock >= config.blocks) {
           // Completed entire experiment

@@ -17,7 +17,9 @@ export interface AppConfig {
   blocks: number;
   durations: number[]; // e.g. [800, 1700, 3100] in ms
   speeds: number[];    // e.g. [300, 500] in units/sec
-  trainingTrialsCount: number; // Number of practice trials before main blocks
+  trainingTrialsCount: number; // Number of practice trials before main blocks (e.g. 24 or 6)
+  trialsPerBlock: number; // Number of trials per block (84 for full 420-trial protocol, or 10 for quick)
+  protocolMode: "full_tz" | "quick"; // Full scientific 420-trial protocol vs quick testing
   feedbackEnabled: boolean;
   eegEnabled: boolean;
   eegInterface: EEGInterface;

@@ -27,6 +27,7 @@ export default function App() {
     currentBlock,
     currentTrial,
     currentMode,
+    activeTrialCondition,
     activeDuration,
     activeSpeed,
     config,
@@ -38,7 +39,7 @@ export default function App() {
     // Mode 1 Visible Reaction, Mode 2 TTC -> Target ideal time is 600ms of visible motion + Ti duration
     // Mode 3 and Mode 4 -> Target ideal time is exact Ti duration
     let targetTime = activeDuration;
-    if (currentMode === ExperimentalMode.REACTION_VISIBLE || currentMode === ExperimentalMode.TTC) {
+    if (activeTrialCondition === ExperimentalMode.REACTION_VISIBLE || activeTrialCondition === ExperimentalMode.TTC) {
       targetTime = 600 + activeDuration;
     }
     
